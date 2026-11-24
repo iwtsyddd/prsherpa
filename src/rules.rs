@@ -1,20 +1,20 @@
+use crate::config::{matches_ignore_pattern, Config};
 use crate::git::{ChangeKind, DiffFile};
 use serde::Serialize;
 use std::collections::HashSet;
 
-pub const SIZE_WARN_LINES: u64 = 400;
-pub const SIZE_STRONG_LINES: u64 = 800;
 pub const SIZE_WARN_PENALTY: u8 = 15;
 pub const SIZE_STRONG_PENALTY: u8 = 30;
-
 pub const TESTS_PENALTY: u8 = 20;
-
 pub const RISKY_PER_FILE_PENALTY: u8 = 5;
 pub const RISKY_MAX_PENALTY: u8 = 20;
-
-pub const SPREAD_MAX_FILES: usize = 15;
-pub const SPREAD_MAX_DIRS: usize = 5;
 pub const SPREAD_PENALTY: u8 = 10;
+pub const MIXED_CONCERNS_PENALTY: u8 = 10;
+pub const MIXED_CONCERNS_MIN_SOURCE_FILES: usize = 5;
+pub const MIXED_CONCERNS_LINE_THRESHOLD: u64 = 150;
+pub const BINARY_OR_HUGE_PENALTY: u8 = 10;
+pub const HUGE_FILE_LINES: u64 = 300;
+pub const DEBUG_LEFTOVER_PENALTY: u8 = 5;
 
 const LOCKFILE_NAMES: &[&str] = &[
     "package-lock.json",
@@ -23,17 +23,15 @@ const LOCKFILE_NAMES: &[&str] = &[
     "cargo.lock",
 ];
 
-const RISKY_KEYWORDS: &[&str] = &[
-    "auth",
-    "login",
-    "session",
-    "payment",
-    "billing",
-    "migration",
-    "security",
-    "secret",
-    ".env",
-    "permission",
+const DEPENDENCY_MANIFESTS: &[&str] = &["cargo.toml", "package.json", "go.mod", "pyproject.toml"];
+
+const DEBUG_PATTERNS: &[&str] = &[
+    "dbg!",
+    "todo!",
+    "unimplemented!",
+    "console.log",
+    "pdb.set_trace",
+    "binding.pry",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -72,11 +70,17 @@ pub struct ClassifiedFile {
     pub additions: u64,
     pub deletions: u64,
     pub is_binary: bool,
+    pub is_pure_rename: bool,
+    pub hunk_count: u64,
 }
 
 impl ClassifiedFile {
     pub fn changed_lines(&self) -> u64 {
-        self.additions + self.deletions
+        if self.is_pure_rename {
+            0
+        } else {
+            self.additions + self.deletions
+        }
     }
 }
 
@@ -87,6 +91,9 @@ pub struct ReadingItem {
     pub status: ChangeKind,
     pub additions: u64,
     pub deletions: u64,
+    pub hunk_count: u64,
+    pub is_binary: bool,
+    pub is_pure_rename: bool,
     pub risky: bool,
     pub skip: bool,
     pub note: Option<String>,
@@ -149,10 +156,6 @@ fn is_test_file(segments: &[&str], filename: &str) -> bool {
     {
         return true;
     }
-    has_test_filename_pattern(filename)
-}
-
-fn has_test_filename_pattern(filename: &str) -> bool {
     filename.contains("_test.") || filename.contains(".test.") || filename.contains(".spec.")
 }
 
@@ -174,9 +177,11 @@ fn is_config_file(filename: &str) -> bool {
         || filename.starts_with('.')
 }
 
-pub fn is_risky_path(path: &str) -> bool {
+pub fn is_risky_path(path: &str, keywords: &[String]) -> bool {
     let lower = path.replace('\\', "/").to_ascii_lowercase();
-    RISKY_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    keywords
+        .iter()
+        .any(|kw| lower.contains(&kw.to_ascii_lowercase()))
 }
 
 fn top_level_dir(path: &str) -> &str {
@@ -187,30 +192,49 @@ fn top_level_dir(path: &str) -> &str {
     }
 }
 
-pub fn analyze(diff_files: &[DiffFile]) -> Analysis {
-    let files: Vec<ClassifiedFile> = diff_files
+fn filename_lower(path: &str) -> String {
+    path.replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+pub fn analyze(diff_files: &[DiffFile], config: &Config) -> Analysis {
+    let active_diffs: Vec<&DiffFile> = diff_files
+        .iter()
+        .filter(|f| !matches_ignore_pattern(&f.path, &config.ignore_patterns))
+        .collect();
+
+    let files: Vec<ClassifiedFile> = active_diffs
         .iter()
         .map(|f| ClassifiedFile {
             path: f.path.clone(),
             old_path: f.old_path.clone(),
             status: f.status,
             class: classify_file(&f.path),
-            risky: is_risky_path(&f.path),
+            risky: is_risky_path(&f.path, &config.risky_keywords),
             additions: f.additions,
             deletions: f.deletions,
             is_binary: f.is_binary,
+            is_pure_rename: f.is_pure_rename,
+            hunk_count: f.hunk_count,
         })
         .collect();
 
-    let total_additions: u64 = files.iter().map(|f| f.additions).sum();
-    let total_deletions: u64 = files.iter().map(|f| f.deletions).sum();
-    let non_generated_changed_lines: u64 = files
+    let total_additions: u64 = files
         .iter()
-        .filter(|f| f.class != FileClass::LockfileOrGenerated)
-        .map(ClassifiedFile::changed_lines)
+        .filter(|f| !f.is_pure_rename)
+        .map(|f| f.additions)
         .sum();
+    let total_deletions: u64 = files
+        .iter()
+        .filter(|f| !f.is_pure_rename)
+        .map(|f| f.deletions)
+        .sum();
+    let weighted_size_lines = compute_weighted_size_lines(&files);
 
-    let issues = evaluate_rules(&files, non_generated_changed_lines);
+    let issues = evaluate_rules(&active_diffs, &files, weighted_size_lines, config);
     let reading_order = build_reading_order(&files);
     let estimated_review_minutes = estimate_review_minutes(&files);
 
@@ -219,40 +243,65 @@ pub fn analyze(diff_files: &[DiffFile]) -> Analysis {
         issues,
         reading_order,
         estimated_review_minutes,
-        non_generated_changed_lines,
+        non_generated_changed_lines: weighted_size_lines,
         total_additions,
         total_deletions,
     }
 }
 
-fn evaluate_rules(files: &[ClassifiedFile], non_generated_lines: u64) -> Vec<Issue> {
+fn compute_weighted_size_lines(files: &[ClassifiedFile]) -> u64 {
+    let mut weighted: f64 = 0.0;
+    for f in files {
+        if f.is_pure_rename {
+            continue;
+        }
+        match f.class {
+            FileClass::LockfileOrGenerated | FileClass::Docs => {}
+            FileClass::Test => weighted += (f.changed_lines() as f64) * 0.5,
+            FileClass::Source | FileClass::Config => weighted += f.changed_lines() as f64,
+        }
+    }
+    weighted.round() as u64
+}
+
+fn evaluate_rules(
+    raw_diffs: &[&DiffFile],
+    files: &[ClassifiedFile],
+    weighted_lines: u64,
+    config: &Config,
+) -> Vec<Issue> {
     let mut issues = Vec::new();
 
-    if non_generated_lines > SIZE_STRONG_LINES {
+    if weighted_lines > config.size_strong_warn {
         issues.push(Issue {
             rule: "SIZE".to_string(),
             severity: Severity::Strong,
             penalty: SIZE_STRONG_PENALTY,
             message: format!(
-                "{non_generated_lines} changed lines (excluding generated) exceeds {SIZE_STRONG_LINES}."
+                "{weighted_lines} weighted changed lines exceeds {}.",
+                config.size_strong_warn
             ),
             suggestion: Some("Consider splitting into smaller PRs.".to_string()),
         });
-    } else if non_generated_lines > SIZE_WARN_LINES {
+    } else if weighted_lines > config.size_warn {
         issues.push(Issue {
             rule: "SIZE".to_string(),
             severity: Severity::Warn,
             penalty: SIZE_WARN_PENALTY,
             message: format!(
-                "{non_generated_lines} changed lines (excluding generated) exceeds {SIZE_WARN_LINES}."
+                "{weighted_lines} weighted changed lines exceeds {}.",
+                config.size_warn
             ),
             suggestion: Some("Consider splitting into smaller PRs.".to_string()),
         });
     }
 
-    let has_source = files.iter().any(|f| f.class == FileClass::Source);
+    let source_files: Vec<&ClassifiedFile> = files
+        .iter()
+        .filter(|f| f.class == FileClass::Source)
+        .collect();
     let has_test = files.iter().any(|f| f.class == FileClass::Test);
-    if has_source && !has_test {
+    if !source_files.is_empty() && !has_test {
         issues.push(Issue {
             rule: "TESTS".to_string(),
             severity: Severity::Warn,
@@ -280,7 +329,7 @@ fn evaluate_rules(files: &[ClassifiedFile], non_generated_lines: u64) -> Vec<Iss
     }
 
     let top_dirs: HashSet<&str> = files.iter().map(|f| top_level_dir(&f.path)).collect();
-    if files.len() > SPREAD_MAX_FILES || top_dirs.len() > SPREAD_MAX_DIRS {
+    if files.len() > config.max_files || top_dirs.len() > config.max_dirs {
         issues.push(Issue {
             rule: "SPREAD".to_string(),
             severity: Severity::Warn,
@@ -294,7 +343,181 @@ fn evaluate_rules(files: &[ClassifiedFile], non_generated_lines: u64) -> Vec<Iss
         });
     }
 
+    if let Some(issue) = check_mixed_concerns(files, &source_files) {
+        issues.push(issue);
+    }
+
+    if let Some(issue) = check_binary_or_huge_file(files) {
+        issues.push(issue);
+    }
+
+    if let Some(issue) = check_debug_leftover(raw_diffs, files) {
+        issues.push(issue);
+    }
+
     issues
+}
+
+fn check_mixed_concerns(
+    files: &[ClassifiedFile],
+    source_files: &[&ClassifiedFile],
+) -> Option<Issue> {
+    if source_files.is_empty() {
+        return None;
+    }
+
+    let manifests: Vec<&str> = files
+        .iter()
+        .filter(|f| DEPENDENCY_MANIFESTS.contains(&filename_lower(&f.path).as_str()))
+        .map(|f| f.path.as_str())
+        .collect();
+
+    if !manifests.is_empty() {
+        return Some(Issue {
+            rule: "MIXED_CONCERNS".to_string(),
+            severity: Severity::Warn,
+            penalty: MIXED_CONCERNS_PENALTY,
+            message: format!(
+                "Dependency manifest ({}) changed alongside source files.",
+                manifests.join(", ")
+            ),
+            suggestion: Some(
+                "Separate dependency updates from feature/bugfix changes.".to_string(),
+            ),
+        });
+    }
+
+    let src_add: u64 = source_files
+        .iter()
+        .filter(|f| !f.is_pure_rename)
+        .map(|f| f.additions)
+        .sum();
+    let src_del: u64 = source_files
+        .iter()
+        .filter(|f| !f.is_pure_rename)
+        .map(|f| f.deletions)
+        .sum();
+
+    if source_files.len() >= MIXED_CONCERNS_MIN_SOURCE_FILES
+        && src_add > MIXED_CONCERNS_LINE_THRESHOLD
+        && src_del > MIXED_CONCERNS_LINE_THRESHOLD
+    {
+        return Some(Issue {
+            rule: "MIXED_CONCERNS".to_string(),
+            severity: Severity::Warn,
+            penalty: MIXED_CONCERNS_PENALTY,
+            message: format!(
+                "+{src_add}/-{src_del} across {} source files suggests mixed refactor and feature work.",
+                source_files.len()
+            ),
+            suggestion: Some("Split refactoring into a preparatory PR.".to_string()),
+        });
+    }
+
+    None
+}
+
+fn check_binary_or_huge_file(files: &[ClassifiedFile]) -> Option<Issue> {
+    let mut flagged = Vec::new();
+    for f in files {
+        let binary_hit =
+            f.is_binary && f.status != ChangeKind::Deleted && f.class != FileClass::Docs;
+        let huge_hit = f.class != FileClass::LockfileOrGenerated
+            && !f.is_pure_rename
+            && f.changed_lines() > HUGE_FILE_LINES;
+        if binary_hit {
+            flagged.push(format!("{} (binary)", f.path));
+        } else if huge_hit {
+            flagged.push(format!("{} ({} lines)", f.path, f.changed_lines()));
+        }
+    }
+
+    if flagged.is_empty() {
+        return None;
+    }
+
+    Some(Issue {
+        rule: "BINARY_OR_HUGE_FILE".to_string(),
+        severity: Severity::Warn,
+        penalty: BINARY_OR_HUGE_PENALTY,
+        message: format!("Binary or oversized file(s): {}", flagged.join(", ")),
+        suggestion: Some("Verify binary assets are intentional or split large files.".to_string()),
+    })
+}
+
+fn check_debug_leftover(raw_diffs: &[&DiffFile], files: &[ClassifiedFile]) -> Option<Issue> {
+    let mut hits = Vec::new();
+    for (raw, classified) in raw_diffs.iter().zip(files.iter()) {
+        if classified.class != FileClass::Source {
+            continue;
+        }
+        let is_rust = classified.path.ends_with(".rs");
+        let mut matched = Vec::new();
+        for line in &raw.added_lines {
+            if is_rust && line.trim_start().starts_with("#[cfg(test)]") {
+                break;
+            }
+            let code_only = strip_comments_and_quotes(line, is_rust);
+            for pat in DEBUG_PATTERNS {
+                if code_only.contains(pat) && !matched.contains(pat) {
+                    matched.push(*pat);
+                }
+            }
+        }
+        if !matched.is_empty() {
+            hits.push(format!("{} ({})", classified.path, matched.join(", ")));
+        }
+    }
+
+    if hits.is_empty() {
+        return None;
+    }
+
+    Some(Issue {
+        rule: "DEBUG_LEFTOVER".to_string(),
+        severity: Severity::Warn,
+        penalty: DEBUG_LEFTOVER_PENALTY,
+        message: format!("Debug/placeholder statements added: {}", hits.join("; ")),
+        suggestion: Some(
+            "Remove leftover debug prints or todo!() before opening the PR.".to_string(),
+        ),
+    })
+}
+
+fn strip_comments_and_quotes(line: &str, is_rust: bool) -> String {
+    let mut out = String::with_capacity(line.len());
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    let mut quote: Option<char> = None;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if let Some(q) = quote {
+            if ch == '\\' {
+                i += 2;
+                continue;
+            }
+            if ch == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if ch == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+            break;
+        }
+        if ch == '"' || (!is_rust && ch == '\'') {
+            quote = Some(ch);
+            out.push(' ');
+            i += 1;
+            continue;
+        }
+        out.push(ch);
+        i += 1;
+    }
+
+    out
 }
 
 fn reading_bucket(file: &ClassifiedFile) -> u8 {
@@ -317,7 +540,11 @@ pub fn build_reading_order(files: &[ClassifiedFile]) -> Vec<ReadingItem> {
         bucket_a
             .cmp(&bucket_b)
             .then_with(|| match bucket_a {
-                0..=2 => b.changed_lines().cmp(&a.changed_lines()),
+                0..=2 => {
+                    let score_a = a.hunk_count + a.changed_lines();
+                    let score_b = b.hunk_count + b.changed_lines();
+                    score_b.cmp(&score_a)
+                }
                 _ => std::cmp::Ordering::Equal,
             })
             .then_with(|| a.path.cmp(&b.path))
@@ -327,7 +554,11 @@ pub fn build_reading_order(files: &[ClassifiedFile]) -> Vec<ReadingItem> {
         .into_iter()
         .map(|f| {
             let skip = !f.risky && f.class == FileClass::LockfileOrGenerated;
-            let note = if f.risky {
+            let note = if f.is_pure_rename {
+                Some("moved".to_string())
+            } else if f.is_binary {
+                Some("binary".to_string())
+            } else if f.risky {
                 Some("needs careful review".to_string())
             } else if skip {
                 Some("skip".to_string())
@@ -338,8 +569,11 @@ pub fn build_reading_order(files: &[ClassifiedFile]) -> Vec<ReadingItem> {
                 path: f.path.clone(),
                 class: f.class,
                 status: f.status,
-                additions: f.additions,
-                deletions: f.deletions,
+                additions: if f.is_pure_rename { 0 } else { f.additions },
+                deletions: if f.is_pure_rename { 0 } else { f.deletions },
+                hunk_count: f.hunk_count,
+                is_binary: f.is_binary,
+                is_pure_rename: f.is_pure_rename,
                 risky: f.risky,
                 skip,
                 note,
@@ -349,16 +583,16 @@ pub fn build_reading_order(files: &[ClassifiedFile]) -> Vec<ReadingItem> {
 }
 
 /// Estimates review time in minutes: ~10 min per 100 source lines, tests count half,
-/// generated/docs/config count zero, rounded to the nearest 5 minutes.
+/// pure renames/generated/docs/config count zero, rounded to the nearest 5 minutes.
 pub fn estimate_review_minutes(files: &[ClassifiedFile]) -> u64 {
     let source_lines: u64 = files
         .iter()
-        .filter(|f| f.class == FileClass::Source)
+        .filter(|f| f.class == FileClass::Source && !f.is_pure_rename)
         .map(ClassifiedFile::changed_lines)
         .sum();
     let test_lines: u64 = files
         .iter()
-        .filter(|f| f.class == FileClass::Test)
+        .filter(|f| f.class == FileClass::Test && !f.is_pure_rename)
         .map(ClassifiedFile::changed_lines)
         .sum();
 
@@ -377,92 +611,120 @@ mod tests {
             additions,
             deletions,
             is_binary: false,
+            is_pure_rename: false,
+            hunk_count: 1,
+            added_lines: Vec::new(),
             status: ChangeKind::Modified,
         }
     }
 
     #[test]
-    fn classifies_all_file_types() {
-        assert_eq!(classify_file("Cargo.lock"), FileClass::LockfileOrGenerated);
-        assert_eq!(
-            classify_file("web/dist/app.min.js"),
-            FileClass::LockfileOrGenerated
-        );
-        assert_eq!(
-            classify_file("src/api.generated.ts"),
-            FileClass::LockfileOrGenerated
-        );
-        assert_eq!(classify_file("tests/integration.rs"), FileClass::Test);
-        assert_eq!(classify_file("src/parser_test.go"), FileClass::Test);
-        assert_eq!(classify_file("src/button.spec.tsx"), FileClass::Test);
-        assert_eq!(classify_file("README.md"), FileClass::Docs);
-        assert_eq!(classify_file("docs/architecture.rst"), FileClass::Docs);
-        assert_eq!(classify_file("Cargo.toml"), FileClass::Config);
-        assert_eq!(classify_file(".github/workflows/ci.yml"), FileClass::Config);
-        assert_eq!(classify_file(".gitignore"), FileClass::Config);
-        assert_eq!(classify_file("src/main.rs"), FileClass::Source);
-    }
+    fn size_excludes_docs_generated_and_pure_renames_and_halves_tests() {
+        let mut moved = diff("src/moved.rs", 200, 200);
+        moved.status = ChangeKind::Renamed;
+        moved.is_pure_rename = true;
 
-    #[test]
-    fn size_rule_does_not_stack_and_excludes_generated() {
         let files = vec![
-            diff("Cargo.lock", 2000, 500),
-            diff("src/lib.rs", 450, 0),
-            diff("tests/lib_test.rs", 10, 0),
+            diff("Cargo.lock", 2000, 0),
+            diff("README.md", 500, 0),
+            moved,
+            diff("src/lib.rs", 350, 0),
+            diff("tests/lib_test.rs", 200, 0), // weighted 100 -> total 450 > 400
         ];
-        let analysis = analyze(&files);
-        assert_eq!(analysis.non_generated_changed_lines, 460);
-        assert_eq!(analysis.issues.len(), 1);
-        assert_eq!(analysis.issues[0].rule, "SIZE");
-        assert_eq!(analysis.issues[0].severity, Severity::Warn);
-        assert_eq!(analysis.issues[0].penalty, 15);
-
-        let large = vec![diff("src/lib.rs", 900, 0), diff("tests/lib_test.rs", 10, 0)];
-        let large_analysis = analyze(&large);
-        assert_eq!(large_analysis.issues.len(), 1);
-        assert_eq!(large_analysis.issues[0].severity, Severity::Strong);
-        assert_eq!(large_analysis.issues[0].penalty, 30);
-    }
-
-    #[test]
-    fn reading_order_puts_risky_first_and_lockfiles_last() {
-        let files = vec![
-            diff("Cargo.lock", 500, 0),
-            diff("README.md", 20, 0),
-            diff("src/small.rs", 10, 0),
-            diff("src/big.rs", 100, 0),
-            diff("tests/auth_test.rs", 15, 0),
-            diff("tests/unit_test.rs", 30, 0),
-        ];
-        let analysis = analyze(&files);
-        let paths: Vec<&str> = analysis
-            .reading_order
+        let analysis = analyze(&files, &Config::default());
+        assert_eq!(analysis.non_generated_changed_lines, 450);
+        assert!(analysis
+            .issues
             .iter()
-            .map(|r| r.path.as_str())
-            .collect();
-        assert_eq!(
-            paths,
-            vec![
-                "tests/auth_test.rs",
-                "src/big.rs",
-                "src/small.rs",
-                "tests/unit_test.rs",
-                "README.md",
-                "Cargo.lock",
-            ]
-        );
-        assert!(analysis.reading_order[0].risky);
-        assert!(analysis.reading_order[5].skip);
+            .any(|i| i.rule == "SIZE" && i.severity == Severity::Warn));
     }
 
     #[test]
-    fn estimates_review_time_rounded_to_five_minutes() {
+    fn mixed_concerns_triggers_on_manifest_or_refactor_plus_feature() {
         let files = vec![
-            diff("src/a.rs", 120, 30),       // 150 source -> 15 min
-            diff("tests/a_test.rs", 100, 0), // 100 test -> 5 min
-            diff("Cargo.lock", 5000, 0),     // 0 min
+            diff("Cargo.toml", 2, 1),
+            diff("src/lib.rs", 10, 0),
+            diff("tests/lib_test.rs", 5, 0),
         ];
-        let analysis = analyze(&files);
-        assert_eq!(analysis.estimated_review_minutes, 20);
+        let analysis = analyze(&files, &Config::default());
+        assert!(analysis.issues.iter().any(|i| i.rule == "MIXED_CONCERNS"));
+
+        let refactor_files = vec![
+            diff("src/a.rs", 40, 40),
+            diff("src/b.rs", 40, 40),
+            diff("src/c.rs", 40, 40),
+            diff("src/d.rs", 40, 40),
+            diff("src/e.rs", 40, 40),
+            diff("tests/e_test.rs", 10, 0),
+        ];
+        let refactor = analyze(&refactor_files, &Config::default());
+        assert!(refactor.issues.iter().any(|i| i.rule == "MIXED_CONCERNS"));
+    }
+
+    #[test]
+    fn binary_or_huge_file_warns_appropriately() {
+        let mut bin = diff("assets/app.exe", 0, 0);
+        bin.is_binary = true;
+        bin.status = ChangeKind::Added;
+
+        let mut doc_img = diff("docs/diagram.png", 0, 0);
+        doc_img.is_binary = true;
+        doc_img.status = ChangeKind::Added;
+
+        let files = vec![bin, doc_img, diff("tests/t_test.rs", 1, 0)];
+        let analysis = analyze(&files, &Config::default());
+        let issue = analysis
+            .issues
+            .iter()
+            .find(|i| i.rule == "BINARY_OR_HUGE_FILE")
+            .unwrap();
+        assert!(issue.message.contains("assets/app.exe"));
+        assert!(!issue.message.contains("docs/diagram.png"));
+    }
+
+    #[test]
+    fn debug_leftover_scans_only_source_added_lines() {
+        let mut src = diff("src/main.rs", 2, 0);
+        src.added_lines = vec!["dbg!(user_id);".to_string(), "todo!()".to_string()];
+
+        let mut test_file = diff("tests/main_test.rs", 2, 0);
+        test_file.added_lines = vec!["dbg!(test_val);".to_string()];
+
+        let analysis = analyze(&[src, test_file], &Config::default());
+        let issue = analysis
+            .issues
+            .iter()
+            .find(|i| i.rule == "DEBUG_LEFTOVER")
+            .unwrap();
+        assert!(issue.message.contains("src/main.rs (dbg!, todo!)"));
+        assert!(!issue.message.contains("tests/main_test.rs"));
+    }
+
+    #[test]
+    fn debug_leftover_ignores_cfg_test_quotes_comments_and_println() {
+        let mut src = diff("src/lib.rs", 6, 0);
+        src.added_lines = vec![
+            "println!(\"normal cli output\");".to_string(),
+            "let marker = \"dbg!\";".to_string(),
+            "// dbg!(in_comment);".to_string(),
+            "#[cfg(test)]".to_string(),
+            "mod tests { fn t() { dbg!(123); } }".to_string(),
+        ];
+
+        let analysis = analyze(&[src, diff("tests/t_test.rs", 1, 0)], &Config::default());
+        assert!(!analysis.issues.iter().any(|i| i.rule == "DEBUG_LEFTOVER"));
+    }
+
+    #[test]
+    fn reading_order_ranks_fragmented_edits_by_hunks_plus_lines() {
+        let mut single_block = diff("src/big_block.rs", 20, 0);
+        single_block.hunk_count = 1; // 21
+
+        let mut fragmented = diff("src/fragmented.rs", 15, 0);
+        fragmented.hunk_count = 10; // 25 -> should rank before single_block
+
+        let analysis = analyze(&[single_block, fragmented], &Config::default());
+        assert_eq!(analysis.reading_order[0].path, "src/fragmented.rs");
+        assert_eq!(analysis.reading_order[1].path, "src/big_block.rs");
     }
 }

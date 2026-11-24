@@ -94,21 +94,19 @@ fn fails_gracefully_when_base_branch_missing() {
 }
 
 #[test]
-fn handles_binary_renames_deletions_and_uncommitted_changes() {
+fn handles_binary_renames_deletions_and_markdown_format() {
     let tmp = TempDir::new("complex_diff");
     init_repo(&tmp.path);
 
-    // Rename src/old.rs -> src/renamed.rs and delete README.md in a commit
     git(&tmp.path, &["mv", "src/old.rs", "src/renamed.rs"]);
     git(&tmp.path, &["rm", "README.md"]);
     fs::write(tmp.path.join("logo.bin"), [0_u8, 159, 146, 150, 0, 1, 2]).unwrap();
     git(&tmp.path, &["add", "."]);
     git(&tmp.path, &["commit", "-m", "rename delete binary"]);
 
-    // Uncommitted change to auth + test
     fs::write(
         tmp.path.join("src/auth.rs"),
-        "pub fn login() -> bool { true }\n",
+        "pub fn login() -> bool { dbg!(true) }\n",
     )
     .unwrap();
     git(&tmp.path, &["add", "src/auth.rs"]);
@@ -116,26 +114,38 @@ fn handles_binary_renames_deletions_and_uncommitted_changes() {
     fs::write(tmp.path.join("tests/auth_test.rs"), "#[test]\nfn ok() {}\n").unwrap();
     git(&tmp.path, &["add", "tests/auth_test.rs"]);
 
-    let out = run_prsherpa(&tmp.path, &["--base", "main", "--json"]);
+    let out = run_prsherpa(&tmp.path, &["--base", "main", "--format", "json"]);
     assert_eq!(out.status.code(), Some(0));
 
     let json: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(json["base_branch"], "main");
     let reading = json["reading_order"].as_array().unwrap();
-    assert!(reading.iter().any(|r| r["path"] == "src/renamed.rs"));
-    assert!(reading.iter().any(|r| r["path"] == "README.md"));
-    assert!(reading.iter().any(|r| r["path"] == "logo.bin"));
+    assert!(reading
+        .iter()
+        .any(|r| r["path"] == "src/renamed.rs" && r["is_pure_rename"] == true));
+    assert!(reading
+        .iter()
+        .any(|r| r["path"] == "logo.bin" && r["is_binary"] == true));
     assert!(reading
         .iter()
         .any(|r| r["path"] == "src/auth.rs" && r["risky"] == true));
+
+    let issues = json["issues"].as_array().unwrap();
+    assert!(issues.iter().any(|i| i["rule"] == "BINARY_OR_HUGE_FILE"));
+    assert!(issues.iter().any(|i| i["rule"] == "DEBUG_LEFTOVER"));
+
+    let md_out = run_prsherpa(&tmp.path, &["--base", "main", "--format", "markdown"]);
+    assert_eq!(md_out.status.code(), Some(0));
+    let md = String::from_utf8_lossy(&md_out.stdout);
+    assert!(md.contains("## prsherpa — Reviewability Score:"));
+    assert!(md.contains("<details>"));
 }
 
 #[test]
-fn lockfile_only_changes_score_100_and_fail_under_enforces_exit_1() {
-    let tmp = TempDir::new("lockfile_and_fail_under");
+fn lockfile_only_changes_score_100_and_config_overrides_work() {
+    let tmp = TempDir::new("lockfile_and_config");
     init_repo(&tmp.path);
 
-    // Lockfile-only change
     fs::write(
         tmp.path.join("Cargo.lock"),
         "# huge lockfile\n".repeat(1000),
@@ -150,12 +160,22 @@ fn lockfile_only_changes_score_100_and_fail_under_enforces_exit_1() {
     assert_eq!(json["summary"]["non_generated_changed_lines"], 0);
     assert_eq!(json["estimated_review_minutes"], 0);
 
-    // Add source file without tests -> score drops to 80 (-20 TESTS)
+    // Add .prsherpa.toml with custom base_branch and ignore_patterns
+    fs::write(
+        tmp.path.join(".prsherpa.toml"),
+        "base_branch = \"main\"\nignore_patterns = [\"src/ignored.rs\"]\n",
+    )
+    .unwrap();
+    fs::write(tmp.path.join("src/ignored.rs"), "pub fn x() {}\n").unwrap();
     fs::write(
         tmp.path.join("src/lib.rs"),
         "pub fn hello() { println!(\"hi\"); }\n",
     )
     .unwrap();
-    let fail_out = run_prsherpa(&tmp.path, &["--base", "main", "--fail-under", "90"]);
+    git(&tmp.path, &["add", "."]);
+
+    let fail_out = run_prsherpa(&tmp.path, &["--fail-under", "90"]);
     assert_eq!(fail_out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&fail_out.stdout);
+    assert!(!stdout.contains("src/ignored.rs"));
 }

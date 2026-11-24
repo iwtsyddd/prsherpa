@@ -1,13 +1,14 @@
 use crate::rules::Issue;
 
 /// Reviewability score formula (0..=100):
-/// 1. Start at 100 points.
-/// 2. Subtract SIZE penalty: -15 if non-generated changed lines > 400, or -30 if > 800 (never stacks).
-/// 3. Subtract TESTS penalty: -20 if source files changed without any test file changes.
-/// 4. Subtract RISKY penalty: -5 per risky file (auth, login, session, payment, billing,
-///    migration, security, secret, .env, permission), capped at -20.
-/// 5. Subtract SPREAD penalty: -10 if > 15 files changed or > 5 top-level directories touched.
-/// 6. Clamp the final score to 0..=100.
+/// 1. Start at 100 points and subtract penalties, clamped to 0..=100.
+/// 2. SIZE: -15 (> 400 weighted lines) or -30 (> 800), excluding docs, generated, pure renames; tests 0.5x.
+/// 3. TESTS: -20 if source files changed without test changes.
+/// 4. RISKY: -5 per risky file (capped at -20).
+/// 5. SPREAD: -10 if > max_files or > max_dirs.
+/// 6. MIXED_CONCERNS: -10 if manifests + source changed or >150/+150 across 5+ source files.
+/// 7. BINARY_OR_HUGE_FILE: -10 if non-docs binary added/modified or single file > 300 lines.
+/// 8. DEBUG_LEFTOVER: -5 if added source lines contain dbg!/todo!/unimplemented!/console.log/pdb.set_trace/binding.pry.
 pub const BASE_SCORE: i32 = 100;
 
 pub fn compute_score(issues: &[Issue]) -> u8 {
@@ -33,7 +34,7 @@ mod tests {
     #[test]
     fn computes_and_clamps_score() {
         assert_eq!(compute_score(&[]), 100);
-        assert_eq!(compute_score(&[issue(15), issue(20)]), 65);
+        assert_eq!(compute_score(&[issue(15), issue(20), issue(10)]), 55);
         assert_eq!(
             compute_score(&[issue(30), issue(20), issue(20), issue(40)]),
             0

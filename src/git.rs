@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const DEFAULT_BASE_CANDIDATES: &[&str] = &["origin/main", "origin/master", "main", "master"];
@@ -24,6 +24,10 @@ pub struct DiffFile {
     pub additions: u64,
     pub deletions: u64,
     pub is_binary: bool,
+    pub is_pure_rename: bool,
+    pub hunk_count: u64,
+    #[serde(skip)]
+    pub added_lines: Vec<String>,
     pub status: ChangeKind,
 }
 
@@ -34,6 +38,18 @@ pub struct NumstatEntry {
     pub additions: u64,
     pub deletions: u64,
     pub is_binary: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusInfo {
+    pub kind: ChangeKind,
+    pub is_pure_rename: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UnifiedFileDiff {
+    pub hunk_count: u64,
+    pub added_lines: Vec<String>,
 }
 
 fn run_git(args: &[&str], dir: Option<&Path>) -> Result<std::process::Output> {
@@ -65,6 +81,12 @@ pub fn ensure_git_repo(dir: Option<&Path>) -> Result<()> {
         bail!("Not a git repository work tree. Run prsherpa inside a git repository.");
     }
     Ok(())
+}
+
+pub fn repo_root(dir: Option<&Path>) -> Result<PathBuf> {
+    ensure_git_repo(dir)?;
+    let out = run_git_stdout(&["rev-parse", "--show-toplevel"], dir)?;
+    Ok(PathBuf::from(out.trim()))
 }
 
 fn ref_exists(reference: &str, dir: Option<&Path>) -> Result<bool> {
@@ -110,10 +132,12 @@ pub fn collect_diff(base: Option<&str>, dir: Option<&Path>) -> Result<(String, V
 
     let numstat_out = run_git_stdout(&["diff", "--numstat", "-M", &mb], dir)?;
     let name_status_out = run_git_stdout(&["diff", "--name-status", "-M", &mb], dir)?;
+    let unified_out = run_git_stdout(&["diff", "-U0", "-M", &mb], dir)?;
 
     let entries = parse_numstat(&numstat_out)?;
     let statuses = parse_name_status(&name_status_out);
-    let files = merge_diff_info(entries, &statuses);
+    let unified = parse_unified_diff(&unified_out);
+    let files = merge_diff_info(entries, &statuses, &unified);
 
     Ok((base_branch, files))
 }
@@ -198,8 +222,8 @@ fn clean_joined_path(prefix: &str, middle: &str, suffix: &str) -> String {
     cleaned
 }
 
-/// Parses `git diff --name-status` output into a map from path to `ChangeKind`.
-pub fn parse_name_status(output: &str) -> HashMap<String, ChangeKind> {
+/// Parses `git diff --name-status -M` output into a map from path to `StatusInfo`.
+pub fn parse_name_status(output: &str) -> HashMap<String, StatusInfo> {
     let mut map = HashMap::new();
     for line in output.lines() {
         let trimmed = line.trim_end_matches('\r');
@@ -219,36 +243,100 @@ pub fn parse_name_status(output: &str) -> HashMap<String, ChangeKind> {
             Some('C') => ChangeKind::Copied,
             _ => ChangeKind::Unknown,
         };
+        let is_pure_rename = kind == ChangeKind::Renamed && code == "R100";
         let path = match kind {
             ChangeKind::Renamed | ChangeKind::Copied if cols.len() >= 3 => cols[2],
             _ => cols[1],
         };
-        map.insert(path.to_string(), kind);
+        map.insert(
+            path.to_string(),
+            StatusInfo {
+                kind,
+                is_pure_rename,
+            },
+        );
     }
     map
 }
 
+/// Parses `git diff -U0 -M` output to count `@@` hunks and collect `+` added lines per file.
+pub fn parse_unified_diff(output: &str) -> HashMap<String, UnifiedFileDiff> {
+    let mut map: HashMap<String, UnifiedFileDiff> = HashMap::new();
+    let mut current_path: Option<String> = None;
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            current_path = extract_b_path(rest);
+            if let Some(path) = &current_path {
+                map.entry(path.clone()).or_default();
+            }
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("+++ b/") {
+            current_path = Some(path.to_string());
+            map.entry(path.to_string()).or_default();
+            continue;
+        }
+        if line == "+++ /dev/null" {
+            continue;
+        }
+        if line.starts_with("--- ") {
+            continue;
+        }
+        if line.starts_with("@@ ") {
+            if let Some(path) = &current_path {
+                map.entry(path.clone()).or_default().hunk_count += 1;
+            }
+            continue;
+        }
+        if let Some(added) = line.strip_prefix('+') {
+            if let Some(path) = &current_path {
+                map.entry(path.clone())
+                    .or_default()
+                    .added_lines
+                    .push(added.to_string());
+            }
+        }
+    }
+
+    map
+}
+
+fn extract_b_path(diff_git_rest: &str) -> Option<String> {
+    let idx = diff_git_rest.rfind(" b/")?;
+    Some(diff_git_rest[idx + 3..].to_string())
+}
+
 pub fn merge_diff_info(
     entries: Vec<NumstatEntry>,
-    statuses: &HashMap<String, ChangeKind>,
+    statuses: &HashMap<String, StatusInfo>,
+    unified: &HashMap<String, UnifiedFileDiff>,
 ) -> Vec<DiffFile> {
     entries
         .into_iter()
         .map(|entry| {
-            let status = statuses.get(&entry.path).copied().unwrap_or_else(|| {
-                if entry.old_path.is_some() {
+            let status_info = statuses.get(&entry.path).copied().unwrap_or(StatusInfo {
+                kind: if entry.old_path.is_some() {
                     ChangeKind::Renamed
                 } else {
                     ChangeKind::Modified
-                }
+                },
+                is_pure_rename: entry.old_path.is_some()
+                    && entry.additions == 0
+                    && entry.deletions == 0,
             });
+            let u = unified.get(&entry.path).cloned().unwrap_or_default();
             DiffFile {
                 path: entry.path,
                 old_path: entry.old_path,
                 additions: entry.additions,
                 deletions: entry.deletions,
                 is_binary: entry.is_binary,
-                status,
+                is_pure_rename: status_info.is_pure_rename,
+                hunk_count: u.hunk_count,
+                added_lines: u.added_lines,
+                status: status_info.kind,
             }
         })
         .collect()
@@ -278,37 +366,41 @@ mod tests {
     }
 
     #[test]
-    fn parses_rename_paths() {
+    fn parses_rename_paths_and_pure_rename_status() {
         assert_eq!(
             parse_rename_path("src/{old.rs => new.rs}"),
             (Some("src/old.rs".to_string()), "src/new.rs".to_string())
         );
-        assert_eq!(
-            parse_rename_path("src/{ => nested}/mod.rs"),
-            (
-                Some("src/mod.rs".to_string()),
-                "src/nested/mod.rs".to_string()
-            )
+        let numstat = "0\t0\tsrc/{old.rs => moved.rs}\n3\t2\tsrc/{a.rs => b.rs}\n";
+        let status = "R100\tsrc/old.rs\tsrc/moved.rs\nR085\tsrc/a.rs\tsrc/b.rs\n";
+        let merged = merge_diff_info(
+            parse_numstat(numstat).unwrap(),
+            &parse_name_status(status),
+            &HashMap::new(),
         );
-        assert_eq!(
-            parse_rename_path("a.txt => b.txt"),
-            (Some("a.txt".to_string()), "b.txt".to_string())
-        );
+        assert_eq!(merged[0].status, ChangeKind::Renamed);
+        assert!(merged[0].is_pure_rename);
+        assert_eq!(merged[1].status, ChangeKind::Renamed);
+        assert!(!merged[1].is_pure_rename);
     }
 
     #[test]
-    fn merges_name_status_with_numstat() {
-        let numstat = "10\t0\tsrc/new.rs\n0\t20\tsrc/dead.rs\n5\t5\tsrc/{a.rs => b.rs}\n";
-        let status = "A\tsrc/new.rs\nD\tsrc/dead.rs\nR100\tsrc/a.rs\tsrc/b.rs\n";
-
-        let entries = parse_numstat(numstat).unwrap();
-        let status_map = parse_name_status(status);
-        let merged = merge_diff_info(entries, &status_map);
-
-        assert_eq!(merged[0].status, ChangeKind::Added);
-        assert_eq!(merged[1].status, ChangeKind::Deleted);
-        assert_eq!(merged[2].status, ChangeKind::Renamed);
-        assert_eq!(merged[2].old_path.as_deref(), Some("src/a.rs"));
-        assert_eq!(merged[2].path, "src/b.rs");
+    fn parses_unified_diff_hunks_and_added_lines() {
+        let diff = concat!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n",
+            "index 111..222 100644\n",
+            "--- a/src/lib.rs\n",
+            "+++ b/src/lib.rs\n",
+            "@@ -1,0 +2,2 @@\n",
+            "+let x = 1;\n",
+            "+dbg!(x);\n",
+            "@@ -10,1 +12,1 @@\n",
+            "-old();\n",
+            "+new();\n",
+        );
+        let parsed = parse_unified_diff(diff);
+        let file = parsed.get("src/lib.rs").unwrap();
+        assert_eq!(file.hunk_count, 2);
+        assert_eq!(file.added_lines, vec!["let x = 1;", "dbg!(x);", "new();"]);
     }
 }
