@@ -65,27 +65,18 @@ name: prsherpa
 on:
   pull_request:
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   reviewability:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install --path .
-      - run: prsherpa --base "origin/${{ github.base_ref }}" --format markdown --fail-under 60 > prsherpa-report.md
-      - uses: actions/github-script@v7
-        if: always()
+          fetch-depth: 0 # Required so git merge-base works accurately
+      - uses: iwtsyddd/prsherpa@v0.1.0
         with:
-          script: |
-            const fs = require('fs');
-            if (!fs.existsSync('prsherpa-report.md')) return;
-            const body = fs.readFileSync('prsherpa-report.md', 'utf8');
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body
-            });
+          fail-under: 60
 ```

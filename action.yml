@@ -1,0 +1,181 @@
+name: prsherpa
+description: Analyze a pull request diff for reviewability score, issues, and reading order
+
+inputs:
+  fail-under:
+    description: Optional minimum reviewability score (0-100); fails the job if score is below this
+    required: false
+    default: ""
+  base:
+    description: Base branch name (defaults to github.base_ref)
+    required: false
+    default: ${{ github.base_ref }}
+  version:
+    description: Release tag to download (e.g. v0.1.0 or latest)
+    required: false
+    default: latest
+
+runs:
+  using: composite
+  steps:
+    - name: Download and verify prsherpa binary
+      id: install
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "${RUNNER_OS}:${RUNNER_ARCH}" in
+          Linux:X64)
+            ASSET="prsherpa-linux-x86_64.tar.gz"
+            BIN_NAME="prsherpa"
+            ;;
+          macOS:ARM64)
+            ASSET="prsherpa-macos-arm64.tar.gz"
+            BIN_NAME="prsherpa"
+            ;;
+          macOS:X64)
+            ASSET="prsherpa-macos-x86_64.tar.gz"
+            BIN_NAME="prsherpa"
+            ;;
+          Windows:X64)
+            ASSET="prsherpa-windows-x86_64.zip"
+            BIN_NAME="prsherpa.exe"
+            ;;
+          *)
+            echo "::error::Unsupported runner platform: ${RUNNER_OS}/${RUNNER_ARCH}"
+            exit 2
+            ;;
+        esac
+
+        VERSION="${{ inputs.version }}"
+        if [ "$VERSION" = "latest" ] || [ -z "$VERSION" ]; then
+          BASE_URL="https://github.com/iwtsyddd/prsherpa/releases/latest/download"
+        else
+          BASE_URL="https://github.com/iwtsyddd/prsherpa/releases/download/${VERSION}"
+        fi
+
+        WORKDIR="${RUNNER_TEMP}/prsherpa-dl"
+        BINDIR="${RUNNER_TEMP}/prsherpa-bin"
+        rm -rf "$WORKDIR" "$BINDIR"
+        mkdir -p "$WORKDIR" "$BINDIR"
+
+        curl -fsSL "${BASE_URL}/${ASSET}" -o "${WORKDIR}/${ASSET}"
+        curl -fsSL "${BASE_URL}/checksums.txt" -o "${WORKDIR}/checksums.txt"
+
+        EXPECTED_SHA="$(grep -E "[[:space:]]${ASSET}$" "${WORKDIR}/checksums.txt" | awk '{print $1}')"
+        if [ -z "$EXPECTED_SHA" ]; then
+          echo "::error::Checksum entry for ${ASSET} not found in checksums.txt"
+          exit 2
+        fi
+
+        if command -v sha256sum >/dev/null 2>&1; then
+          ACTUAL_SHA="$(sha256sum "${WORKDIR}/${ASSET}" | awk '{print $1}')"
+        else
+          ACTUAL_SHA="$(shasum -a 256 "${WORKDIR}/${ASSET}" | awk '{print $1}')"
+        fi
+
+        if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+          echo "::error::Checksum verification failed for ${ASSET} (expected ${EXPECTED_SHA}, got ${ACTUAL_SHA})"
+          exit 2
+        fi
+
+        if [[ "$ASSET" == *.zip ]]; then
+          unzip -q -o "${WORKDIR}/${ASSET}" -d "$BINDIR"
+        else
+          tar -xzf "${WORKDIR}/${ASSET}" -C "$BINDIR"
+        fi
+        chmod +x "${BINDIR}/${BIN_NAME}"
+        echo "bin=${BINDIR}/${BIN_NAME}" >> "$GITHUB_OUTPUT"
+
+    - name: Run prsherpa
+      id: run
+      shell: bash
+      run: |
+        set -euo pipefail
+        BIN="${{ steps.install.outputs.bin }}"
+        BASE_BRANCH="${{ inputs.base }}"
+        if [ -z "$BASE_BRANCH" ]; then
+          BASE_BRANCH="main"
+        fi
+
+        ARGS=(--base "origin/${BASE_BRANCH}" --format markdown)
+        if [ -n "${{ inputs.fail-under }}" ]; then
+          ARGS+=(--fail-under "${{ inputs.fail-under }}")
+        fi
+
+        REPORT_FILE="${RUNNER_TEMP}/prsherpa-report.md"
+        ERR_FILE="${RUNNER_TEMP}/prsherpa-err.txt"
+
+        set +e
+        "$BIN" "${ARGS[@]}" > "$REPORT_FILE" 2> "$ERR_FILE"
+        EC=$?
+        set -e
+
+        if [ "$EC" -eq 2 ]; then
+          cat "$ERR_FILE" >&2
+          exit 2
+        fi
+
+        FIRST_LINE="$(head -n 1 "$REPORT_FILE" | tr -d '\r')"
+        if [ "$FIRST_LINE" != "<!-- prsherpa -->" ]; then
+          echo "::error::Expected markdown report to start with <!-- prsherpa --> marker."
+          exit 2
+        fi
+
+        cat "$REPORT_FILE" >> "$GITHUB_STEP_SUMMARY"
+        echo "exit_code=${EC}" >> "$GITHUB_OUTPUT"
+        echo "report_path=${REPORT_FILE}" >> "$GITHUB_OUTPUT"
+
+    - name: Post or update sticky PR comment
+      if: (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && steps.run.outputs.report_path != ''
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const marker = '<!-- prsherpa -->';
+          const body = fs.readFileSync('${{ steps.run.outputs.report_path }}', 'utf8');
+
+          const pr = context.payload.pull_request;
+          const headRepo = pr?.head?.repo?.full_name;
+          const baseRepo = `${context.repo.owner}/${context.repo.repo}`;
+          if (headRepo && headRepo !== baseRepo) {
+            core.info(`Fork PR detected (${headRepo}); skipping PR comment due to read-only token.`);
+            return;
+          }
+
+          try {
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
+          } catch (err) {
+            if (err && err.status === 403) {
+              core.info('Skipping PR comment due to read-only token (HTTP 403).');
+              return;
+            }
+            throw err;
+          }
+
+    - name: Enforce fail-under threshold
+      if: inputs.fail-under != '' && steps.run.outputs.exit_code == '1'
+      shell: bash
+      run: |
+        echo "::error::Reviewability score is below --fail-under (${{ inputs.fail-under }})."
+        exit 1

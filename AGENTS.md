@@ -2,7 +2,7 @@
 
 `prsherpa` is a Rust CLI that checks a git branch **before** a pull request is opened. It prints a reviewability score, a list of issues, a reading order for the reviewer, and an estimated review time. It is offline and deterministic; the core has no LLM.
 
-Current phase: **MVP** (parse diff -> rules -> score -> report). Do not start `--explain` (opt-in LLM) or the GitHub Action unless asked.
+Current phase: **GitHub Action** (`release.yml`, `action.yml`, sticky PR comment). Do not start `--explain` (opt-in LLM) unless asked.
 
 ## Commands
 

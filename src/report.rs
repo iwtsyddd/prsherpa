@@ -48,6 +48,7 @@ pub fn render_json(report: &Report) -> Result<String> {
 
 pub fn render_markdown(report: &Report) -> String {
     let mut out = String::new();
+    let _ = writeln!(out, "<!-- prsherpa -->");
     let _ = writeln!(
         out,
         "## prsherpa — Reviewability Score: {}/100",
@@ -364,6 +365,7 @@ mod tests {
     #[test]
     fn markdown_includes_score_issues_and_details() {
         let md = render_markdown(&sample_report(4));
+        assert!(md.starts_with("<!-- prsherpa -->\n"));
         assert!(md.contains("Reviewability Score: 85/100"));
         assert!(md.contains("**[WARN] `DEBUG_LEFTOVER` (-5)**"));
         assert!(md.contains("<details>"));

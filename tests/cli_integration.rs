@@ -137,6 +137,7 @@ fn handles_binary_renames_deletions_and_markdown_format() {
     let md_out = run_prsherpa(&tmp.path, &["--base", "main", "--format", "markdown"]);
     assert_eq!(md_out.status.code(), Some(0));
     let md = String::from_utf8_lossy(&md_out.stdout);
+    assert!(md.starts_with("<!-- prsherpa -->"));
     assert!(md.contains("## prsherpa — Reviewability Score:"));
     assert!(md.contains("<details>"));
 }
