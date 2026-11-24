@@ -1,0 +1,11 @@
+[package]
+name = "prsherpa"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+owo-colors = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
