@@ -4,6 +4,8 @@
 
 It is offline, deterministic, and calls the `git` CLI directly.
 
+![prsherpa demo](assets/demo.gif)
+
 ## Install
 
 ```bash
